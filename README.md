@@ -16,6 +16,7 @@ A [channel](https://code.claude.com/docs/en/channels-reference) MCP server that 
 - **Zero config.** Auto-discovers its own session ID from the parent process.
 - **Peer discovery.** Finds other running sessions automatically.
 - **Portless.** File watches instead of HTTP listeners.
+- **Cron scheduling.** Schedule recurring messages with intervals or cron expressions.
 
 ## Getting Started
 
@@ -39,6 +40,32 @@ claude --dangerously-load-development-channels server:ccchat
 ```
 
 Tell either instance to send a message. They find each other automatically.
+
+## Prompts
+
+### Send a message
+
+> Send "hello from the other side" to the other session
+
+### Schedule a recurring message
+
+> Every 30 seconds, ask the other session to run the tests
+
+> Schedule a reminder every 5 minutes to check build status
+
+### Check active jobs
+
+> What jobs are scheduled?
+
+### Cancel a job
+
+> Cancel that scheduled job
+
+> Cancel all scheduled jobs
+
+### Discover peers
+
+> Who else is connected?
 
 ## License
 

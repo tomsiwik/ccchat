@@ -5,6 +5,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { Cron } from "croner";
 import { watch } from "fs";
 import { readdir, unlink } from "fs/promises";
 import path from "path";
@@ -12,6 +13,10 @@ import path from "path";
 const HOME = process.env.HOME!;
 const SESSIONS_DIR = path.join(HOME, ".claude", "sessions");
 const MAILBOX_ROOT = path.join(HOME, ".claude", "channels", "ccchat");
+
+type Msg = { from: string; text: string; ts: number };
+type ScheduledJob = { id: string; to: string; text: string; cron: string; job: Cron };
+const jobs: ScheduledJob[] = [];
 
 async function findSessionId(): Promise<string> {
   const ppid = process.ppid;
@@ -35,6 +40,31 @@ async function getPeers(): Promise<string[]> {
   return entries.filter((e) => e !== SESSION_ID && !e.startsWith("."));
 }
 
+async function resolveTarget(to_session?: string): Promise<string | null> {
+  if (to_session) return to_session;
+  const peers = await getPeers();
+  return peers.length === 1 ? peers[0] : null;
+}
+
+async function deliver(target: string, msg: Msg) {
+  const targetInbox = path.join(MAILBOX_ROOT, target);
+  await Bun.$`mkdir -p ${targetInbox}`;
+  await Bun.write(path.join(targetInbox, `${Date.now()}-${msg.from}.json`), JSON.stringify(msg));
+}
+
+function delayToCron(delay: string): string | null {
+  const m = delay.match(/^(\d+)\s*(s|m|h|d)$/);
+  if (!m) return null;
+  const n = parseInt(m[1]);
+  switch (m[2]) {
+    case "s": return `*/${n} * * * * *`;
+    case "m": return `0 */${n} * * * *`;
+    case "h": return `0 0 */${n} * * *`;
+    case "d": return `0 0 0 */${n} * *`;
+  }
+  return null;
+}
+
 const SESSION_ID = await findSessionId();
 const MY_INBOX = path.join(MAILBOX_ROOT, SESSION_ID);
 await Bun.$`mkdir -p ${MY_INBOX}`;
@@ -50,11 +80,14 @@ const mcp = new Server(
       `You are in a two-way chat with another Claude Code instance.`,
       `Your session: "${SESSION_ID}".`,
       `Inbound messages arrive as <channel source="ccchat" from_session="...">.`,
-      `Use "send" to reply. Use "list_peers" to discover sessions.`,
-      `If there's only one peer, "send" targets it automatically.`,
+      `Tools: "send" (one-off), "schedule" (recurring cron), "cancel", "list_peers", "list_jobs".`,
+      `If there's only one peer, target is automatic.`,
+      `"schedule" is always recurring. Use "every" (30s, 5m) or "cron" expression. Cancel with "cancel".`,
     ].join("\n"),
   }
 );
+
+const text = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
@@ -71,42 +104,107 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "schedule",
+      description: "Schedule a recurring message. Use interval (30s, 5m, 2h) or cron expression. Always recurring — use cancel to stop.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          text: { type: "string", description: "The message to send" },
+          every: { type: "string", description: "Interval shorthand: 30s, 5m, 2h, 1d" },
+          cron: { type: "string", description: "Cron expression (6-field with seconds), e.g. */30 * * * * *" },
+          to_session: { type: "string", description: "Target session ID (optional if one peer)" },
+        },
+        required: ["text"],
+      },
+    },
+    {
+      name: "cancel",
+      description: "Cancel a scheduled job by ID, or 'all' to cancel everything",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          id: { type: "string", description: "Job ID from list_jobs, or 'all'" },
+        },
+        required: ["id"],
+      },
+    },
+    {
       name: "list_peers",
       description: "List other active ccchat sessions",
+      inputSchema: { type: "object" as const, properties: {} },
+    },
+    {
+      name: "list_jobs",
+      description: "List active scheduled jobs",
       inputSchema: { type: "object" as const, properties: {} },
     },
   ],
 }));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
-  const text = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
-
   if (req.params.name === "list_peers") {
     const peers = await getPeers();
     return text(peers.length ? peers.join("\n") : "No peers found.");
   }
 
+  if (req.params.name === "list_jobs") {
+    const active = jobs.filter((j) => j.job.isRunning());
+    if (!active.length) return text("No active jobs.");
+    return text(active.map((j) => {
+      const next = j.job.nextRun()?.toLocaleTimeString() ?? "—";
+      return `[${j.id}] ${j.cron} -> ${j.to}: "${j.text.slice(0, 40)}" next: ${next}`;
+    }).join("\n"));
+  }
+
+  if (req.params.name === "cancel") {
+    const { id } = req.params.arguments as { id: string };
+    if (id === "all") {
+      jobs.forEach((j) => j.job.stop());
+      const count = jobs.length;
+      jobs.length = 0;
+      return text(`Cancelled ${count} job(s).`);
+    }
+    const idx = jobs.findIndex((j) => j.id === id);
+    if (idx === -1) return text(`Job ${id} not found.`);
+    jobs[idx].job.stop();
+    jobs.splice(idx, 1);
+    return text(`Cancelled ${id}.`);
+  }
+
   if (req.params.name === "send") {
     const args = req.params.arguments as { text: string; to_session?: string };
-
-    let target = args.to_session;
+    const target = await resolveTarget(args.to_session);
     if (!target) {
       const peers = await getPeers();
-      if (peers.length === 0) return text("No peers found.");
-      if (peers.length > 1) return text(`Multiple peers. Specify to_session: ${peers.join(", ")}`);
-      target = peers[0];
+      return text(peers.length ? `Multiple peers. Specify to_session: ${peers.join(", ")}` : "No peers found.");
     }
-
-    const targetInbox = path.join(MAILBOX_ROOT, target);
-    const msgFile = path.join(targetInbox, `${Date.now()}-${SESSION_ID}.json`);
-
     try {
-      await Bun.$`mkdir -p ${targetInbox}`;
-      await Bun.write(msgFile, JSON.stringify({ from: SESSION_ID, text: args.text, ts: Date.now() }));
+      await deliver(target, { from: SESSION_ID, text: args.text, ts: Date.now() });
       return text(`Sent to ${target}.`);
     } catch (e: any) {
       return text(`Failed: ${e.message}`);
     }
+  }
+
+  if (req.params.name === "schedule") {
+    const args = req.params.arguments as { text: string; every?: string; cron?: string; to_session?: string };
+    const target = await resolveTarget(args.to_session);
+    if (!target) {
+      const peers = await getPeers();
+      return text(peers.length ? `Multiple peers. Specify to_session: ${peers.join(", ")}` : "No peers found.");
+    }
+
+    const cronExpr = args.cron ?? (args.every ? delayToCron(args.every) : null);
+    if (!cronExpr) return text("Provide 'every' (30s, 5m, 2h, 1d) or 'cron' expression.");
+
+    const id = crypto.randomUUID().slice(0, 8);
+    const job = new Cron(cronExpr, async () => {
+      await deliver(target, { from: SESSION_ID, text: args.text, ts: Date.now() });
+    });
+
+    jobs.push({ id, to: target, text: args.text, cron: cronExpr, job });
+    const next = job.nextRun()?.toLocaleTimeString() ?? "now";
+    return text(`Job ${id} scheduled (${cronExpr}). Next: ${next}. Use cancel("${id}") to stop.`);
   }
 
   throw new Error(`Unknown tool: ${req.params.name}`);
@@ -120,7 +218,7 @@ watch(MY_INBOX, async (_event, filename) => {
   try {
     const file = Bun.file(msgPath);
     if (!(await file.exists())) return;
-    const msg = await file.json() as { from: string; text: string };
+    const msg = await file.json() as Msg;
     await mcp.notification({
       method: "notifications/claude/channel",
       params: { content: msg.text, meta: { from_session: msg.from } },
