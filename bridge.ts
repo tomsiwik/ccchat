@@ -52,6 +52,12 @@ async function deliver(target: string, msg: Msg) {
   await Bun.write(path.join(targetInbox, `${Date.now()}-${msg.from}.json`), JSON.stringify(msg));
 }
 
+async function broadcast(msg: Msg) {
+  const peers = await getPeers();
+  await Promise.all(peers.map((p) => deliver(p, msg)));
+  return peers.length;
+}
+
 function delayToCron(delay: string): string | null {
   const m = delay.match(/^(\d+)\s*(s|m|h|d)$/);
   if (!m) return null;
@@ -80,8 +86,8 @@ const mcp = new Server(
       `You are in a two-way chat with another Claude Code instance.`,
       `Your session: "${SESSION_ID}".`,
       `Inbound messages arrive as <channel source="ccchat" from_session="...">.`,
-      `Tools: "send" (one-off), "schedule" (recurring cron), "cancel", "list_peers", "list_jobs".`,
-      `If there's only one peer, target is automatic.`,
+      `Tools: "send" (one-off), "broadcast" (send to all), "schedule" (recurring cron), "cancel", "list_peers", "list_jobs".`,
+      `If there's only one peer, "send" targets it automatically.`,
       `"schedule" is always recurring. Use "every" (30s, 5m) or "cron" expression. Cancel with "cancel".`,
     ].join("\n"),
   }
@@ -104,6 +110,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "broadcast",
+      description: "Send a message to all connected sessions",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          text: { type: "string", description: "The message to send to all peers" },
+        },
+        required: ["text"],
+      },
+    },
+    {
       name: "schedule",
       description: "Schedule a recurring message. Use interval (30s, 5m, 2h) or cron expression. Always recurring — use cancel to stop.",
       inputSchema: {
@@ -112,7 +129,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: "string", description: "The message to send" },
           every: { type: "string", description: "Interval shorthand: 30s, 5m, 2h, 1d" },
           cron: { type: "string", description: "Cron expression (6-field with seconds), e.g. */30 * * * * *" },
-          to_session: { type: "string", description: "Target session ID (optional if one peer)" },
+          to_session: { type: "string", description: "Target session ID, 'all' for broadcast (optional if one peer)" },
         },
         required: ["text"],
       },
@@ -171,6 +188,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     return text(`Cancelled ${id}.`);
   }
 
+  if (req.params.name === "broadcast") {
+    const { text: msgText } = req.params.arguments as { text: string };
+    const count = await broadcast({ from: SESSION_ID, text: msgText, ts: Date.now() });
+    return text(count ? `Broadcast to ${count} peer(s).` : "No peers found.");
+  }
+
   if (req.params.name === "send") {
     const args = req.params.arguments as { text: string; to_session?: string };
     const target = await resolveTarget(args.to_session);
@@ -199,7 +222,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     const id = crypto.randomUUID().slice(0, 8);
     const job = new Cron(cronExpr, async () => {
-      await deliver(target, { from: SESSION_ID, text: args.text, ts: Date.now() });
+      const msg = { from: SESSION_ID, text: args.text, ts: Date.now() };
+      if (target === "all") await broadcast(msg);
+      else await deliver(target, msg);
     });
 
     jobs.push({ id, to: target, text: args.text, cron: cronExpr, job });

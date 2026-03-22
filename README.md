@@ -47,6 +47,10 @@ Tell either instance to send a message. They find each other automatically.
 
 > Send "hello from the other side" to the other session
 
+### Broadcast to all sessions
+
+> Tell all sessions to pull the latest changes
+
 ### Schedule a recurring message
 
 > Every 30 seconds, ask the other session to run the tests
