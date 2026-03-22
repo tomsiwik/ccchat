@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ccchat": {
+      "command": "bun",
+      "args": ["./bridge.ts"]
+    }
+  }
+}
