@@ -77,4 +77,4 @@ Tell either instance to send a message. They find each other automatically.
 
 <br />
 
-<p align="center">Made with Claude Code by <a href="https://github.com/tomsiwik">tomsiwik</a></p>
+<p align="center">Made with ♥️ by <a href="https://github.com/tomsiwik">tomsiwik</a></p>
